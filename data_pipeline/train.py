@@ -14,6 +14,7 @@ session reset mid-training):
 """
 
 import argparse
+import random
 import time
 from pathlib import Path
 
@@ -23,7 +24,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataset import FaceDataset, build_dataset_splits, get_eval_transform, get_train_transform
+from dataset import FaceDataset, build_dataset_splits, get_eval_transform, get_train_transform, load_extra_training_frames
 
 
 def get_device() -> torch.device:
@@ -99,6 +100,8 @@ def train_model(
     checkpoint_dir: str = "checkpoints",
     resume_from: str = None,
     initial_best_accuracy: float = 0.0,
+    extra_real_dir: str = None,
+    extra_fake_dir: str = None,
 ):
     """
     Full training run: builds splits, dataloaders, model, and runs the
@@ -130,6 +133,18 @@ def train_model(
 
     # --- Data ---
     train_samples, val_samples, test_samples = build_dataset_splits(faces_root)
+
+    # Diversify TRAINING data only — val/test stay exactly as they were,
+    # so results remain comparable to every prior run on this same
+    # FaceForensics++-based test set, while the model gets exposure to
+    # a second dataset's manipulation style during training.
+    if extra_real_dir:
+        train_samples.extend(load_extra_training_frames(extra_real_dir, label=0))
+    if extra_fake_dir:
+        train_samples.extend(load_extra_training_frames(extra_fake_dir, label=1))
+    if extra_real_dir or extra_fake_dir:
+        random.shuffle(train_samples)
+        print(f"Training set after adding extra data: {len(train_samples)} frames")
 
     train_dataset = FaceDataset(train_samples, transform=get_train_transform())
     val_dataset = FaceDataset(val_samples, transform=get_eval_transform())
@@ -221,6 +236,12 @@ def main():
     parser.add_argument("--initial_best_accuracy", type=float, default=0.0,
                          help="Val accuracy the resumed checkpoint already achieved, so early "
                               "stopping/best-checkpoint logic compares correctly.")
+    parser.add_argument("--extra_real_dir", default=None,
+                         help="Optional: path to an extra folder of aligned real-face videos "
+                              "(e.g. a non-overlapping Celeb-DF slice) to ADD to training only — "
+                              "val/test are unaffected, for diversifying training data.")
+    parser.add_argument("--extra_fake_dir", default=None,
+                         help="Optional: same as --extra_real_dir but for extra fake-face videos.")
     args = parser.parse_args()
 
     train_model(
@@ -234,6 +255,8 @@ def main():
         checkpoint_dir=args.checkpoint_dir,
         resume_from=args.resume_from,
         initial_best_accuracy=args.initial_best_accuracy,
+        extra_real_dir=args.extra_real_dir,
+        extra_fake_dir=args.extra_fake_dir,
     )
 
 
