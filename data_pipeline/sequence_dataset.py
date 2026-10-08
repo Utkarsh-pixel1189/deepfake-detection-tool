@@ -91,6 +91,9 @@ def build_sequence_splits(
         (embedding_path, label) tuples.
     """
     embeddings_root = Path(embeddings_root)
+    if (embeddings_root / "real").exists() and (embeddings_root / "fake").exists():
+        return build_sequence_splits_cdf(embeddings_root, val_ratio, test_ratio, seed)
+
     rng = random.Random(seed)
 
     train_samples, val_samples, test_samples = [], [], []
@@ -133,6 +136,65 @@ def build_sequence_splits(
 
     print(f"\nTotal videos -> train: {len(train_samples)}, val: {len(val_samples)}, test: {len(test_samples)}")
 
+    return train_samples, val_samples, test_samples
+
+
+def build_sequence_splits_cdf(
+    embeddings_root,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    seed: int = 42,
+):
+    """
+    Celeb-DF-v3 layout version (embeddings_root/real/... + fake/<group>/<method>/...).
+
+    Mirrors dataset.build_dataset_splits_cdf step for step (same category
+    ordering, same seed, same per-category shuffle) so every video lands in
+    the SAME split as in CNN training - no train/test leakage between the
+    CNN stage and the temporal stage. Videos with zero usable frames are
+    dropped AFTER splitting (they still took part in the shuffle, exactly
+    as they did for the CNN).
+    """
+    embeddings_root = Path(embeddings_root)
+    rng = random.Random(seed)
+    train_samples, val_samples, test_samples = [], [], []
+
+    def leaf_dirs(root):
+        return [d for d in root.rglob("*") if d.is_dir() and any(f.suffix == ".npy" for f in d.iterdir())]
+
+    category_dirs = [(d, 0) for d in leaf_dirs(embeddings_root / "real")]
+    category_dirs += [(d, 1) for d in leaf_dirs(embeddings_root / "fake")]
+    if not category_dirs:
+        raise ValueError(f"No embedding folders found under {embeddings_root}.")
+
+    dropped = 0
+    for category_dir, label in sorted(category_dirs, key=lambda c: str(c[0])):
+        video_ids = sorted(f.stem for f in category_dir.glob("*.npy"))
+        rng.shuffle(video_ids)
+
+        n_total = len(video_ids)
+        n_val = max(1, int(n_total * val_ratio))
+        n_test = max(1, int(n_total * test_ratio))
+        n_train = n_total - n_val - n_test
+
+        for ids, bucket in ((video_ids[:n_train], train_samples),
+                            (video_ids[n_train:n_train + n_val], val_samples),
+                            (video_ids[n_train + n_val:], test_samples)):
+            for vid in ids:
+                path = category_dir / f"{vid}.npy"
+                if np.load(path, mmap_mode="r").shape[0] == 0:
+                    dropped += 1
+                    continue
+                bucket.append((path, label))
+
+        print(f"{category_dir.relative_to(embeddings_root)}: {n_train} train, {n_val} val, "
+              f"{n_total - n_train - n_val} test videos")
+
+    rng.shuffle(train_samples)
+    rng.shuffle(val_samples)
+    rng.shuffle(test_samples)
+    print(f"\nTotal videos -> train: {len(train_samples)}, val: {len(val_samples)}, "
+          f"test: {len(test_samples)} (dropped {dropped} empty videos)")
     return train_samples, val_samples, test_samples
 
 

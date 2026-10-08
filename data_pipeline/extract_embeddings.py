@@ -32,7 +32,7 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 
-from dataset import CATEGORY_LABELS, IMAGE_EXTENSIONS, get_eval_transform
+from dataset import CATEGORY_LABELS, IMAGE_EXTENSIONS, _find_leaf_category_dirs, get_eval_transform
 
 
 def get_device() -> torch.device:
@@ -61,7 +61,8 @@ def load_feature_extractor(checkpoint_path: str, backbone_name: str, device: tor
     return model
 
 
-def extract_embeddings_for_video(video_dir: Path, model, transform, device: torch.device) -> np.ndarray:
+def extract_embeddings_for_video(video_dir: Path, model, transform, device: torch.device,
+                                 batch_size: int = 32) -> np.ndarray:
     """
     Run every frame in one video's folder through the feature extractor,
     in filename order (so the sequence preserves temporal order), and
@@ -75,15 +76,17 @@ def extract_embeddings_for_video(video_dir: Path, model, transform, device: torc
     if not frame_paths:
         return np.empty((0,))
 
+    # Batched forward pass (chunks of `batch_size` frames) - same numbers as
+    # one-frame-at-a-time because the model is in eval mode (BatchNorm uses
+    # running stats, dropout off), but far faster on GPU.
     embeddings = []
     with torch.no_grad():
-        for frame_path in frame_paths:
-            image = Image.open(frame_path).convert("RGB")
-            tensor = transform(image).unsqueeze(0).to(device)  # add batch dim
-            embedding = model(tensor)  # shape: (1, embedding_dim)
-            embeddings.append(embedding.squeeze(0).cpu().numpy())
+        for start in range(0, len(frame_paths), batch_size):
+            chunk = frame_paths[start:start + batch_size]
+            batch = torch.stack([transform(Image.open(p).convert("RGB")) for p in chunk]).to(device)
+            embeddings.append(model(batch).cpu().numpy())  # (chunk, embedding_dim)
 
-    return np.stack(embeddings)  # shape: (num_frames, embedding_dim)
+    return np.concatenate(embeddings, axis=0)  # shape: (num_frames, embedding_dim)
 
 
 def main():
@@ -104,28 +107,42 @@ def main():
     model = load_feature_extractor(args.checkpoint, args.backbone, device)
     transform = get_eval_transform()  # no augmentation — we want stable, consistent embeddings
 
-    # Only process categories that are part of the labeled dataset
-    # (mirrors dataset.py's CATEGORY_LABELS — faceshifter_holdout is
-    # intentionally excluded here too, same reasoning: it's reserved
-    # for the Week 7 generalization test, not used in training).
-    for category in CATEGORY_LABELS:
-        category_dir = faces_root / category
+    # Build the list of (category_dir, relative_output_subpath) to process.
+    # FF++ layout: categories sit directly under faces_root (CATEGORY_LABELS;
+    # faceshifter_holdout is intentionally excluded). Celeb-DF-v3 layout
+    # (real/ + fake/): categories are auto-discovered and the real/ + fake/
+    # folder structure is mirrored in the output, so sequence_dataset.py can
+    # reproduce the exact same video-level split the CNN was trained with.
+    if (faces_root / "real").exists() and (faces_root / "fake").exists():
+        print("Detected Celeb-DF-v3-style layout (real/ + fake/)")
+        category_dirs = _find_leaf_category_dirs(faces_root / "real") + _find_leaf_category_dirs(faces_root / "fake")
+        jobs = [(d, d.relative_to(faces_root)) for d in sorted(category_dirs, key=lambda d: str(d))]
+    else:
+        jobs = [(faces_root / c, Path(c)) for c in CATEGORY_LABELS]
+
+    for category_dir, rel in jobs:
         if not category_dir.exists():
             print(f"Warning: category folder not found, skipping: {category_dir}")
             continue
 
-        category_output_dir = output_dir / category
+        category_output_dir = output_dir / rel
         category_output_dir.mkdir(parents=True, exist_ok=True)
 
         video_dirs = sorted(p for p in category_dir.iterdir() if p.is_dir())
-        print(f"\n{category}: extracting embeddings for {len(video_dirs)} videos...")
+        print(f"\n{rel}: extracting embeddings for {len(video_dirs)} videos...")
 
-        for video_dir in tqdm(video_dirs, desc=f"  {category}", unit="video"):
+        for video_dir in tqdm(video_dirs, desc=f"  {rel}", unit="video"):
             output_path = category_output_dir / f"{video_dir.name}.npy"
             if output_path.exists():
                 continue  # already done — allows resuming an interrupted run
 
             embeddings = extract_embeddings_for_video(video_dir, model, transform, device)
+            if embeddings.size == 0:
+                # Video had every frame discarded during alignment. Still write a
+                # placeholder so the folder listing (and therefore the seeded
+                # train/val/test shuffle) matches the CNN's split exactly;
+                # sequence_dataset.py drops empty videos after splitting.
+                embeddings = np.zeros((0, model.num_features), dtype=np.float32)
             np.save(output_path, embeddings)
 
     print("\nDone. Embeddings cached to:", output_dir)

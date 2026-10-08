@@ -151,7 +151,20 @@ def train_temporal_model(
         else:
             print(f"Warning: --resume_from path not found ({resume_path}), starting fresh instead.")
 
-    criterion = nn.CrossEntropyLoss()
+    # Inverse-frequency class weights from the TRAIN split only. Celeb-DF-v3 is
+    # heavily fake-skewed at the video level, so unweighted loss would push the
+    # model to just say "fake".
+    n_real = sum(1 for _, l in train_samples if l == 0)
+    n_fake = len(train_samples) - n_real
+    if n_real > 0 and n_fake > 0:
+        total = n_real + n_fake
+        class_weights = torch.tensor([total / (2 * n_real), total / (2 * n_fake)],
+                                     dtype=torch.float32, device=device)
+        print(f"Train videos -> real: {n_real}, fake: {n_fake} | loss weights -> "
+              f"real: {class_weights[0]:.3f}, fake: {class_weights[1]:.3f}")
+    else:
+        class_weights = None
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
     checkpoint_dir = Path(checkpoint_dir)
