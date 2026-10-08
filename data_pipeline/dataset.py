@@ -4,8 +4,9 @@ dataset.py
 PyTorch Dataset for the deepfake detection CNN, plus train/val/test
 split logic over the aligned face crops produced by mtcnn_align.py.
 
-Expected folder layout (one folder per category, as produced by the
-pipeline so far):
+Two dataset layouts are supported:
+
+1. FaceForensics++ layout (original, hardcoded categories):
 
     faces/
         original/<video_id>/frame_00000.jpg, ...
@@ -18,13 +19,25 @@ pipeline so far):
                                                   holdout and must never appear
                                                   in train/val/test splits.
 
-Labels: "original" -> 0 (real), every manipulated category -> 1 (fake).
+2. Celeb-DF-v3 layout (auto-discovered categories, nested by method):
 
-Splitting is done at the VIDEO level, not the frame level. Frames from
-the same video are highly correlated (near-duplicate faces a fraction
-of a second apart), so splitting at the frame level would leak near-
-identical images across train/val/test and inflate validation/test
-accuracy artificially. Splitting by video_id avoids that.
+    faces/
+        real/<real_category>/<video_id>/frame_00000.jpg, ...
+        fake/<group>/<method>/<video_id>/frame_00000.jpg, ...
+
+   Held-out method folders (LivePortrait/GHOST/SadTalker) should simply
+   not be present under faces_root - build_dataset_splits_cdf has no
+   concept of holdouts, it splits whatever category folders it finds.
+
+Labels: real -> 0, fake -> 1 (for FF++: "original" -> 0, every
+manipulated category -> 1).
+
+Splitting is done at the VIDEO level, not the frame level, in both
+layouts. Frames from the same video are highly correlated (near-
+duplicate faces a fraction of a second apart), so splitting at the
+frame level would leak near-identical images across train/val/test and
+inflate validation/test accuracy artificially. Splitting by video_id
+avoids that.
 """
 
 import io
@@ -180,6 +193,33 @@ def _frames_for_video(category_dir: Path, video_id: str, label: int) -> list:
     ]
 
 
+def _is_leaf_video_dir(d: Path) -> bool:
+    """A directory with no further subdirectories inside it - the bottom
+    of the folder tree, i.e. a single video's frame folder (even if that
+    video had every frame discarded during alignment and is now empty)."""
+    return d.is_dir() and not any(c.is_dir() for c in d.iterdir())
+
+
+def _find_leaf_category_dirs(root: Path) -> list:
+    """
+    Find every directory whose immediate children are all leaf video
+    folders. Used for datasets like Celeb-DF-v3 where fake methods are
+    nested under group folders (fake/FaceSwap/BlendFace/<video_id>/...)
+    rather than sitting directly under faces_root like FaceForensics++'s
+    layout does. Category names are discovered automatically, not
+    hardcoded, so this works regardless of how many real sources or
+    fake methods are present.
+    """
+    leaf_dirs = []
+    for d in root.rglob("*"):
+        if not d.is_dir():
+            continue
+        subdirs = [c for c in d.iterdir() if c.is_dir()]
+        if subdirs and all(_is_leaf_video_dir(c) for c in subdirs):
+            leaf_dirs.append(d)
+    return leaf_dirs
+
+
 def load_extra_training_frames(extra_dir: str, label: int) -> list:
     """
     Loads every frame from every video folder under extra_dir as extra
@@ -283,13 +323,103 @@ def build_dataset_splits(
     return train_samples, val_samples, test_samples
 
 
+def build_dataset_splits_cdf(
+    faces_root: str,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    seed: int = 42,
+):
+    """
+    Same video-level train/val/test splitting as build_dataset_splits,
+    but for the Celeb-DF-v3 layout instead of FaceForensics++'s:
+
+        faces_root/
+            real/<real_category>/<video_id>/frame_*.jpg
+            fake/<group>/<method>/<video_id>/frame_*.jpg
+
+    Category folders are discovered automatically (not hardcoded by
+    name), so this works across however many real sub-sources or fake
+    methods are present under real/ and fake/. Label is inferred from
+    whether a category folder's path sits under faces_root/real or
+    faces_root/fake.
+
+    Splitting is done at the VIDEO level per category, same rationale
+    as build_dataset_splits: avoid leaking near-duplicate frames from
+    one video across train/val/test.
+
+    Any held-out method folders (e.g. LivePortrait/GHOST/SadTalker)
+    should simply not be present under faces_root in the first place -
+    this function doesn't know about holdouts, it splits whatever
+    category folders it finds.
+    """
+    faces_root = Path(faces_root)
+    real_root = faces_root / "real"
+    fake_root = faces_root / "fake"
+
+    if not real_root.exists() or not fake_root.exists():
+        raise ValueError(
+            f"Expected '{faces_root}' to contain 'real/' and 'fake/' subfolders "
+            f"(Celeb-DF-v3 layout). Found real={real_root.exists()}, fake={fake_root.exists()}."
+        )
+
+    rng = random.Random(seed)
+    train_samples, val_samples, test_samples = [], [], []
+
+    category_dirs = [(d, 0) for d in _find_leaf_category_dirs(real_root)]
+    category_dirs += [(d, 1) for d in _find_leaf_category_dirs(fake_root)]
+
+    if not category_dirs:
+        raise ValueError(f"No category folders with video subfolders found under {faces_root}.")
+
+    for category_dir, label in sorted(category_dirs, key=lambda c: str(c[0])):
+        video_ids = _collect_video_ids(category_dir)
+        if not video_ids:
+            print(f"Warning: no videos found at {category_dir}")
+            continue
+
+        rng.shuffle(video_ids)
+
+        n_total = len(video_ids)
+        n_val = max(1, int(n_total * val_ratio))
+        n_test = max(1, int(n_total * test_ratio))
+        n_train = n_total - n_val - n_test
+
+        train_ids = video_ids[:n_train]
+        val_ids = video_ids[n_train:n_train + n_val]
+        test_ids = video_ids[n_train + n_val:]
+
+        for video_id in train_ids:
+            train_samples.extend(_frames_for_video(category_dir, video_id, label))
+        for video_id in val_ids:
+            val_samples.extend(_frames_for_video(category_dir, video_id, label))
+        for video_id in test_ids:
+            test_samples.extend(_frames_for_video(category_dir, video_id, label))
+
+        rel = category_dir.relative_to(faces_root)
+        print(f"{rel}: {n_train} train videos, {len(val_ids)} val videos, "
+              f"{len(test_ids)} test videos")
+
+    rng.shuffle(train_samples)
+    rng.shuffle(val_samples)
+    rng.shuffle(test_samples)
+
+    print(f"\nTotal frames -> train: {len(train_samples)}, "
+          f"val: {len(val_samples)}, test: {len(test_samples)}")
+
+    return train_samples, val_samples, test_samples
+
+
 if __name__ == "__main__":
     # Quick sanity check: run this directly to confirm splits build
     # correctly before wiring it into the training loop.
     import sys
 
     faces_root = sys.argv[1] if len(sys.argv) > 1 else "faces"
-    train_samples, val_samples, test_samples = build_dataset_splits(faces_root)
+    faces_root_path = Path(faces_root)
+    if (faces_root_path / "real").exists() and (faces_root_path / "fake").exists():
+        train_samples, val_samples, test_samples = build_dataset_splits_cdf(faces_root)
+    else:
+        train_samples, val_samples, test_samples = build_dataset_splits(faces_root)
 
     if train_samples:
         train_ds = FaceDataset(train_samples, transform=get_train_transform())

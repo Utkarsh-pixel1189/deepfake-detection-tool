@@ -11,6 +11,10 @@ Resume from an interrupted run (e.g. a Kaggle/Colab quota cutoff or
 session reset mid-training):
     python train.py --faces_root faces --backbone xception --epochs 10 \\
         --resume_from checkpoints/xception_best.pth --initial_best_accuracy 0.87
+
+Works on both the FaceForensics++ layout and the Celeb-DF-v3 layout
+(faces_root/real/... + faces_root/fake/...) — the right split function
+is picked automatically based on faces_root's structure.
 """
 
 import argparse
@@ -24,7 +28,14 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataset import FaceDataset, build_dataset_splits, get_eval_transform, get_train_transform, load_extra_training_frames
+from dataset import (
+    FaceDataset,
+    build_dataset_splits,
+    build_dataset_splits_cdf,
+    get_eval_transform,
+    get_train_transform,
+    load_extra_training_frames,
+)
 
 
 def get_device() -> torch.device:
@@ -119,6 +130,9 @@ def train_model(
     best" logic compare against the real prior best rather than 0.0
     (which would make the very first epoch after resume look like an
     improvement even if it's actually worse than what you resumed from).
+    Only meaningful when resuming onto the SAME val set the number was
+    measured on — a number from a different val set (e.g. FF++'s) isn't
+    comparable and should be left at the default 0.0 instead.
 
     Note: this resumes MODEL WEIGHTS only, not optimizer state (momentum,
     etc.) — the optimizer restarts fresh. For fine-tuning a few more
@@ -132,12 +146,23 @@ def train_model(
     print(f"Using device: {device}")
 
     # --- Data ---
-    train_samples, val_samples, test_samples = build_dataset_splits(faces_root)
+    # Auto-detect which dataset layout faces_root uses. Celeb-DF-v3's
+    # layout nests fake methods under group folders and sits real/fake
+    # content under top-level real/ and fake/ folders; FaceForensics++'s
+    # layout has its categories directly under faces_root with no such
+    # split, so the two are distinguishable just by checking for those
+    # two folders.
+    faces_root_path = Path(faces_root)
+    if (faces_root_path / "real").exists() and (faces_root_path / "fake").exists():
+        print(f"Detected Celeb-DF-v3-style layout (real/ + fake/) under {faces_root}")
+        train_samples, val_samples, test_samples = build_dataset_splits_cdf(faces_root)
+    else:
+        train_samples, val_samples, test_samples = build_dataset_splits(faces_root)
 
     # Diversify TRAINING data only — val/test stay exactly as they were,
     # so results remain comparable to every prior run on this same
-    # FaceForensics++-based test set, while the model gets exposure to
-    # a second dataset's manipulation style during training.
+    # test set, while the model gets exposure to a second dataset's
+    # manipulation style during training.
     if extra_real_dir:
         train_samples.extend(load_extra_training_frames(extra_real_dir, label=0))
     if extra_fake_dir:
@@ -165,7 +190,29 @@ def train_model(
         else:
             print(f"Warning: --resume_from path not found ({resume_path}), starting from pretrained weights instead.")
 
-    criterion = nn.CrossEntropyLoss()
+    # --- Class weighting ---
+    # Celeb-DF-v3's training frames are heavily imbalanced (~1:6 real:fake
+    # at the frame level, observed on the 21-category aligned-face set).
+    # Unweighted CrossEntropyLoss would bias the model toward predicting
+    # "fake". Weight is inverse-frequency, computed from the actual
+    # training split (after any --extra_*_dir additions), never val/test.
+    label_counts = {0: 0, 1: 0}
+    for _, label in train_samples:
+        label_counts[label] += 1
+    total_train = label_counts[0] + label_counts[1]
+    if label_counts[0] > 0 and label_counts[1] > 0:
+        class_weights = torch.tensor(
+            [total_train / (2 * label_counts[0]), total_train / (2 * label_counts[1])],
+            dtype=torch.float32,
+            device=device,
+        )
+        print(f"Train class counts -> real: {label_counts[0]}, fake: {label_counts[1]} "
+              f"| loss weights -> real: {class_weights[0]:.3f}, fake: {class_weights[1]:.3f}")
+    else:
+        class_weights = None
+        print("Warning: one class is missing from the training split entirely; skipping class weighting.")
+
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
     checkpoint_dir = Path(checkpoint_dir)
