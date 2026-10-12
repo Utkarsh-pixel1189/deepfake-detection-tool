@@ -58,6 +58,8 @@ def run_one_epoch(model, dataloader, criterion, optimizer, device, is_training: 
     total_loss = 0.0
     correct = 0
     total = 0
+    class_correct = [0, 0]
+    class_total = [0, 0]
     batch_times = []
 
     context = torch.enable_grad() if is_training else torch.no_grad()
@@ -82,6 +84,10 @@ def run_one_epoch(model, dataloader, criterion, optimizer, device, is_training: 
             predictions = outputs.argmax(dim=1)
             correct += (predictions == labels).sum().item()
             total += labels.size(0)
+            for c in (0, 1):
+                mask = labels == c
+                class_total[c] += mask.sum().item()
+                class_correct[c] += ((predictions == labels) & mask).sum().item()
 
             batch_times.append(time.time() - batch_start)
             running_loss = total_loss / total
@@ -94,9 +100,14 @@ def run_one_epoch(model, dataloader, criterion, optimizer, device, is_training: 
                 "s/batch": f"{avg_batch_time:.2f}",
             })
 
+    real_acc = class_correct[0] / class_total[0] if class_total[0] else 0.0
+    fake_acc = class_correct[1] / class_total[1] if class_total[1] else 0.0
     return {
         "loss": total_loss / total if total > 0 else 0.0,
         "accuracy": correct / total if total > 0 else 0.0,
+        "real_acc": real_acc,
+        "fake_acc": fake_acc,
+        "balanced_accuracy": (real_acc + fake_acc) / 2,
     }
 
 
@@ -113,6 +124,8 @@ def train_model(
     initial_best_accuracy: float = 0.0,
     extra_real_dir: str = None,
     extra_fake_dir: str = None,
+    extra_split_roots: list = None,
+    select_by: str = "balanced_accuracy",
 ):
     """
     Full training run: builds splits, dataloaders, model, and runs the
@@ -158,6 +171,26 @@ def train_model(
         train_samples, val_samples, test_samples = build_dataset_splits_cdf(faces_root)
     else:
         train_samples, val_samples, test_samples = build_dataset_splits(faces_root)
+
+    # JOINT multi-source training: each extra root is split at the video
+    # level with the same seed/ratios, and its train AND val parts are
+    # merged in (its test part stays untouched for later evaluation).
+    # A model fine-tuned on one dataset alone learned that dataset's
+    # quirks and failed on others, so every source we want to work on
+    # must be in training. Held-out sets (e.g. faceshifter_holdout) are
+    # simply never passed here.
+    for extra_root in (extra_split_roots or []):
+        extra_root_path = Path(extra_root)
+        if (extra_root_path / "real").exists() and (extra_root_path / "fake").exists():
+            e_train, e_val, _ = build_dataset_splits_cdf(extra_root)
+        else:
+            e_train, e_val, _ = build_dataset_splits(extra_root)
+        train_samples.extend(e_train)
+        val_samples.extend(e_val)
+        print(f"Joint training: added {len(e_train)} train / {len(e_val)} val frames from {extra_root}")
+    if extra_split_roots:
+        random.shuffle(train_samples)
+        random.shuffle(val_samples)
 
     # Diversify TRAINING data only — val/test stay exactly as they were,
     # so results remain comparable to every prior run on this same
@@ -245,11 +278,13 @@ def train_model(
         print(
             f"Epoch {epoch}/{epochs} ({elapsed:.1f}s) | "
             f"train_loss: {train_metrics['loss']:.4f} train_acc: {train_metrics['accuracy']:.4f} | "
-            f"val_loss: {val_metrics['loss']:.4f} val_acc: {val_metrics['accuracy']:.4f}"
+            f"val_loss: {val_metrics['loss']:.4f} val_acc: {val_metrics['accuracy']:.4f} | "
+            f"val real_acc: {val_metrics['real_acc']:.4f} fake_acc: {val_metrics['fake_acc']:.4f} "
+            f"balanced: {val_metrics['balanced_accuracy']:.4f}"
         )
 
-        if val_metrics["accuracy"] > best_val_accuracy:
-            best_val_accuracy = val_metrics["accuracy"]
+        if val_metrics[select_by] > best_val_accuracy:
+            best_val_accuracy = val_metrics[select_by]
             epochs_without_improvement = 0
             checkpoint_path = checkpoint_dir / f"{backbone_name}_best.pth"
             torch.save(model.state_dict(), checkpoint_path)
@@ -263,7 +298,7 @@ def train_model(
                       f"{early_stopping_patience} consecutive epochs. Stopping at epoch {epoch}/{epochs}.")
                 break
 
-    print(f"\nTraining done. Best val accuracy: {best_val_accuracy:.4f}")
+    print(f"\nTraining done. Best val {select_by}: {best_val_accuracy:.4f}")
     return model
 
 
@@ -289,6 +324,12 @@ def main():
                               "val/test are unaffected, for diversifying training data.")
     parser.add_argument("--extra_fake_dir", default=None,
                          help="Optional: same as --extra_real_dir but for extra fake-face videos.")
+    parser.add_argument("--extra_split_root", action="append", default=[],
+                         help="Joint training: another faces root (FF++ or Celeb-DF layout) whose "
+                              "train+val videos are merged in. Repeatable. Never pass a holdout folder.")
+    parser.add_argument("--select_by", default="balanced_accuracy", choices=["accuracy", "balanced_accuracy"],
+                         help="Metric used to pick the best checkpoint (default balanced_accuracy, "
+                              "because validation is mostly fake videos).")
     args = parser.parse_args()
 
     train_model(
@@ -304,6 +345,8 @@ def main():
         initial_best_accuracy=args.initial_best_accuracy,
         extra_real_dir=args.extra_real_dir,
         extra_fake_dir=args.extra_fake_dir,
+        extra_split_roots=args.extra_split_root,
+        select_by=args.select_by,
     )
 
 
