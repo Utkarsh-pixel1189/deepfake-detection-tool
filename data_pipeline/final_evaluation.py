@@ -73,6 +73,8 @@ def compute_metrics(labels, fake_probs, threshold: float = 0.5) -> dict:
     if len(set(labels.tolist())) == 2:
         m["precision"] = float(precision_score(labels, preds))
         m["recall"] = float(recall_score(labels, preds))
+        m["specificity"] = float(((preds == 0) & (labels == 0)).sum() / max((labels == 0).sum(), 1))
+        m["balanced_accuracy"] = (m["recall"] + m["specificity"]) / 2
         m["f1"] = float(f1_score(labels, preds))
         m["auc_roc"] = float(roc_auc_score(labels, fake_probs))
     elif labels[0] == 1:
@@ -80,6 +82,26 @@ def compute_metrics(labels, fake_probs, threshold: float = 0.5) -> dict:
     else:
         m["specificity"] = m["accuracy"]          # all-real set: fraction passed as real
     return m
+
+
+def best_threshold(labels, fake_probs) -> float:
+    """
+    Threshold that maximizes BALANCED accuracy (mean of fake-recall and
+    real-specificity) on the given set. Plain accuracy is misleading here
+    because ~90% of the videos are fake. Ties go to the value closest to 0.5.
+    Fit this on VALIDATION data only, then apply it to test/held-out sets.
+    """
+    labels = np.asarray(labels)
+    probs = np.asarray(fake_probs)
+    best, best_score = 0.5, -1.0
+    for t in np.linspace(0.02, 0.98, 97):
+        preds = (probs >= t).astype(int)
+        rec = ((preds == 1) & (labels == 1)).sum() / max((labels == 1).sum(), 1)
+        spec = ((preds == 0) & (labels == 0)).sum() / max((labels == 0).sum(), 1)
+        score = (rec + spec) / 2
+        if score > best_score + 1e-9 or (abs(score - best_score) <= 1e-9 and abs(t - 0.5) < abs(best - 0.5)):
+            best, best_score = float(t), score
+    return best
 
 
 def per_category_breakdown(samples: list, fake_probs, root: Path, threshold: float = 0.5) -> dict:
@@ -106,7 +128,7 @@ def load_fake_only_dir(embeddings_dir: str) -> list:
 
 def fmt(m: dict) -> str:
     parts = [f"n={m['n']}", f"acc={m['accuracy']:.4f}"]
-    for key in ("precision", "recall", "f1", "auc_roc", "detection_rate", "specificity"):
+    for key in ("precision", "recall", "specificity", "balanced_accuracy", "f1", "auc_roc", "detection_rate"):
         if key in m:
             parts.append(f"{key}={m[key]:.4f}")
     return "  ".join(parts)
@@ -152,16 +174,27 @@ def temporal_fake_probs(samples: list, model, device, batch_size: int = 16) -> n
 # Main flow
 # ----------------------------------------------------------------------------
 
-def evaluate_set(name: str, samples: list, cnn_fn, temporal_fn, results: dict, root: Path = None):
+def evaluate_set(name: str, samples: list, cnn_fn, temporal_fn, results: dict, root: Path = None, thr: dict = None):
     labels = [l for _, l in samples]
     cnn_p, tmp_p = cnn_fn(samples), temporal_fn(samples)
     entry = {"cnn_only": compute_metrics(labels, cnn_p), "cnn_lstm_rnn": compute_metrics(labels, tmp_p)}
-    if root is not None:
-        entry["per_category_cnn_lstm_rnn"] = per_category_breakdown(samples, tmp_p, root)
-    results[name] = entry
     print(f"\n=== {name} ===")
-    print(f"  CNN-only        : {fmt(entry['cnn_only'])}")
-    print(f"  CNN+LSTM+RNN    : {fmt(entry['cnn_lstm_rnn'])}")
+    print(f"  CNN-only                 : {fmt(entry['cnn_only'])}")
+    print(f"  CNN+LSTM+RNN             : {fmt(entry['cnn_lstm_rnn'])}")
+    if thr:
+        entry["cnn_only_calibrated"] = compute_metrics(labels, cnn_p, thr["cnn"])
+        entry["cnn_lstm_rnn_calibrated"] = compute_metrics(labels, tmp_p, thr["tmp"])
+        print(f"  CNN-only @thr={thr['cnn']:.2f}       : {fmt(entry['cnn_only_calibrated'])}")
+        print(f"  CNN+LSTM+RNN @thr={thr['tmp']:.2f}   : {fmt(entry['cnn_lstm_rnn_calibrated'])}")
+    if root is not None:
+        cat_cnn = per_category_breakdown(samples, cnn_p, root)
+        cat_tmp = per_category_breakdown(samples, tmp_p, root)
+        entry["per_category"] = {k: {"n": cat_cnn[k]["n"], "cnn_only_acc": cat_cnn[k]["accuracy"],
+                                     "cnn_lstm_rnn_acc": cat_tmp[k]["accuracy"]} for k in cat_cnn}
+        print(f"  {'category':36s} {'n':>4s} {'CNN-only':>9s} {'CNN+LSTM+RNN':>13s}")
+        for k, v in entry["per_category"].items():
+            print(f"  {k:36s} {v['n']:4d} {v['cnn_only_acc']:9.3f} {v['cnn_lstm_rnn_acc']:13.3f}")
+    results[name] = entry
     return entry
 
 
@@ -173,15 +206,22 @@ def run(args):
     fc_w, fc_b = load_cnn_head(args.xception_checkpoint)
 
     root = Path(args.embeddings_root)
-    _, _, test_samples = build_sequence_splits(args.embeddings_root)
+    _, val_samples, test_samples = build_sequence_splits(args.embeddings_root)
     embedding_dim = np.load(test_samples[0][0], mmap_mode="r").shape[1]
     model = load_temporal_model(args.temporal_checkpoint, embedding_dim, not args.no_attention, device)
 
     cnn_fn = lambda s: cnn_only_fake_probs(s, fc_w, fc_b)
     tmp_fn = lambda s: temporal_fake_probs(s, model, device, args.batch_size)
 
-    results = {}
-    evaluate_set("IN-DISTRIBUTION TEST (Celeb-DF-v3 test split)", test_samples, cnn_fn, tmp_fn, results, root)
+    # Decision thresholds fitted on VALIDATION videos only (never test / held-out).
+    val_labels = [l for _, l in val_samples]
+    thr = {"cnn": best_threshold(val_labels, cnn_fn(val_samples)),
+           "tmp": best_threshold(val_labels, tmp_fn(val_samples))}
+    print(f"\nCalibrated thresholds (max balanced accuracy on val): "
+          f"CNN-only={thr['cnn']:.2f}  CNN+LSTM+RNN={thr['tmp']:.2f}")
+
+    results = {"calibrated_thresholds": thr}
+    evaluate_set("IN-DISTRIBUTION TEST (Celeb-DF-v3 test split)", test_samples, cnn_fn, tmp_fn, results, root, thr)
 
     real_test = [(p, l) for p, l in test_samples if l == 0]
     all_holdout = []
@@ -192,16 +232,16 @@ def run(args):
             print(f"\nWarning: no usable embeddings in {path}, skipping {name}")
             continue
         all_holdout.extend(fakes)
-        evaluate_set(f"HELD-OUT {name} (alone, all fake)", fakes, cnn_fn, tmp_fn, results)
-        evaluate_set(f"HELD-OUT {name} + real test videos", real_test + fakes, cnn_fn, tmp_fn, results)
+        evaluate_set(f"HELD-OUT {name} (alone, all fake)", fakes, cnn_fn, tmp_fn, results, thr=thr)
+        evaluate_set(f"HELD-OUT {name} + real test videos", real_test + fakes, cnn_fn, tmp_fn, results, thr=thr)
 
     if len(args.holdout) > 1 and all_holdout:
-        evaluate_set("ALL HELD-OUT METHODS + real test videos", real_test + all_holdout, cnn_fn, tmp_fn, results)
+        evaluate_set("ALL HELD-OUT METHODS + real test videos", real_test + all_holdout, cnn_fn, tmp_fn, results, thr=thr)
 
     if args.legacy_embeddings_root:
         _, _, legacy_test = build_sequence_splits(args.legacy_embeddings_root)
         evaluate_set("LEGACY FF++ TEST SPLIT (new CNN embeddings)", legacy_test, cnn_fn, tmp_fn, results,
-                     Path(args.legacy_embeddings_root))
+                     Path(args.legacy_embeddings_root), thr)
 
     if args.output_json:
         Path(args.output_json).write_text(json.dumps(results, indent=2))
