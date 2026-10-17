@@ -179,15 +179,20 @@ def train_model(
     # quirks and failed on others, so every source we want to work on
     # must be in training. Held-out sets (e.g. faceshifter_holdout) are
     # simply never passed here.
-    for extra_root in (extra_split_roots or []):
+    for extra_spec in (extra_split_roots or []):
+        # Optional oversampling: "path::K" repeats that root's TRAIN frames K times,
+        # so a small but important source (e.g. real-world clips) is not drowned
+        # out by tens of thousands of frames from the big datasets.
+        extra_root, _, repeat_text = extra_spec.partition("::")
+        repeat = int(repeat_text) if repeat_text else 1
         extra_root_path = Path(extra_root)
         if (extra_root_path / "real").exists() and (extra_root_path / "fake").exists():
             e_train, e_val, _ = build_dataset_splits_cdf(extra_root)
         else:
             e_train, e_val, _ = build_dataset_splits(extra_root)
-        train_samples.extend(e_train)
+        train_samples.extend(e_train * repeat)
         val_samples.extend(e_val)
-        print(f"Joint training: added {len(e_train)} train / {len(e_val)} val frames from {extra_root}")
+        print(f"Joint training: added {len(e_train)} train frames (x{repeat}) / {len(e_val)} val frames from {extra_root}")
     if extra_split_roots:
         random.shuffle(train_samples)
         random.shuffle(val_samples)
@@ -326,7 +331,8 @@ def main():
                          help="Optional: same as --extra_real_dir but for extra fake-face videos.")
     parser.add_argument("--extra_split_root", action="append", default=[],
                          help="Joint training: another faces root (FF++ or Celeb-DF layout) whose "
-                              "train+val videos are merged in. Repeatable. Never pass a holdout folder.")
+                              "train+val videos are merged in. Repeatable. Append ::K to repeat its train "
+                              "frames K times (oversampling). Never pass a holdout folder.")
     parser.add_argument("--select_by", default="balanced_accuracy", choices=["accuracy", "balanced_accuracy"],
                          help="Metric used to pick the best checkpoint (default balanced_accuracy, "
                               "because validation is mostly fake videos).")
