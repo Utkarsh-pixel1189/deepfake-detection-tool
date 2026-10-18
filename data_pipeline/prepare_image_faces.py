@@ -48,6 +48,10 @@ def main():
     ap.add_argument("--in_dir", required=True)
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--max_side", type=int, default=512)
+    ap.add_argument("--min_face", type=int, default=112,
+                    help="Skip faces narrower than this many px (default 112).")
+    ap.add_argument("--face_res", type=int, default=112,
+                    help="Every face is shrunk to this size, then enlarged to 224, so all have equal sharpness.")
     ap.add_argument("--limit", type=int, default=None)
     args = ap.parse_args()
 
@@ -66,7 +70,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     mtcnn = MTCNN(keep_all=True, device=device)
 
-    kept, no_face, errors, face_widths = 0, 0, 0, []
+    kept, no_face, too_small, errors, face_widths = 0, 0, 0, 0, []
     for p in tqdm(paths, unit="img"):
         target = out_dir / f"{p.stem}.jpg"
         if target.exists():                       # resume support
@@ -81,14 +85,21 @@ def main():
                 continue
             x1, y1, x2, y2 = box
             x1, y1, x2, y2 = max(0, x1), max(0, y1), min(img.width, x2), min(img.height, y2)
+            if (x2 - x1) < args.min_face:         # too small: would need heavy upscaling
+                too_small += 1
+                continue
             face_widths.append(x2 - x1)
-            img.crop((x1, y1, x2, y2)).resize(OUTPUT_SIZE).save(target)   # JPEG, PIL default quality
+            face = img.crop((x1, y1, x2, y2))
+            # Same effective sharpness for every face: shrink to face_res, then up to 224.
+            face = face.resize((args.face_res, args.face_res), Image.LANCZOS).resize(OUTPUT_SIZE, Image.BICUBIC)
+            face.save(target)                     # JPEG, PIL default quality
             kept += 1
         except Exception as e:
             errors += 1
             print(f"  error on {p.name}: {e}")
 
-    print(f"\nDONE {args.in_dir}: kept {kept}, no face {no_face}, errors {errors}")
+    print(f"\nDONE {args.in_dir}: kept {kept}, no face {no_face}, "
+          f"face too small {too_small}, errors {errors}")
     if face_widths:
         fw = np.array(face_widths)
         print(f"Detected face width BEFORE resize (px): median {np.median(fw):.0f}, "
