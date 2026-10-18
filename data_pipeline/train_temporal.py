@@ -22,7 +22,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from sequence_dataset import VideoSequenceDataset, build_sequence_splits, collate_sequences
+from sequence_dataset import (
+    VideoSequenceDataset,
+    build_sequence_splits,
+    build_sequence_splits_multi,
+    collate_sequences,
+)
 from temporal_model import TemporalFusionModel, TemporalFusionAttentionModel
 
 
@@ -41,6 +46,8 @@ def run_one_epoch(model, dataloader, criterion, optimizer, device, is_training: 
     total_loss = 0.0
     correct = 0
     total = 0
+    class_correct = [0, 0]
+    class_total = [0, 0]
 
     context = torch.enable_grad() if is_training else torch.no_grad()
     progress_bar = tqdm(dataloader, desc=f"  {phase_name}", unit="batch", leave=False)
@@ -63,15 +70,24 @@ def run_one_epoch(model, dataloader, criterion, optimizer, device, is_training: 
             predictions = outputs.argmax(dim=1)
             correct += (predictions == labels).sum().item()
             total += labels.size(0)
+            for c in (0, 1):
+                mask = labels == c
+                class_total[c] += mask.sum().item()
+                class_correct[c] += ((predictions == labels) & mask).sum().item()
 
             progress_bar.set_postfix({
                 "loss": f"{total_loss / total:.4f}",
                 "acc": f"{correct / total:.4f}",
             })
 
+    real_acc = class_correct[0] / class_total[0] if class_total[0] else 0.0
+    fake_acc = class_correct[1] / class_total[1] if class_total[1] else 0.0
     return {
         "loss": total_loss / total if total > 0 else 0.0,
         "accuracy": correct / total if total > 0 else 0.0,
+        "real_acc": real_acc,
+        "fake_acc": fake_acc,
+        "balanced_accuracy": (real_acc + fake_acc) / 2,
     }
 
 
@@ -91,6 +107,8 @@ def train_temporal_model(
     resume_from: str = None,
     initial_best_accuracy: float = 0.0,
     use_attention: bool = False,
+    extra_embeddings_roots: list = None,
+    select_by: str = "balanced_accuracy",
 ):
     """
     Full training run for the LSTM+RNN fusion model.
@@ -105,7 +123,12 @@ def train_temporal_model(
     device = get_device()
     print(f"Using device: {device}")
 
-    train_samples, val_samples, test_samples = build_sequence_splits(embeddings_root)
+    if extra_embeddings_roots:
+        # Joint multi-source training: embeddings_root plus every extra root.
+        train_samples, val_samples, test_samples = build_sequence_splits_multi(
+            [embeddings_root] + list(extra_embeddings_roots))
+    else:
+        train_samples, val_samples, test_samples = build_sequence_splits(embeddings_root)
 
     if not train_samples:
         raise ValueError(
@@ -185,11 +208,13 @@ def train_temporal_model(
         print(
             f"Epoch {epoch}/{epochs} ({elapsed:.1f}s) | "
             f"train_loss: {train_metrics['loss']:.4f} train_acc: {train_metrics['accuracy']:.4f} | "
-            f"val_loss: {val_metrics['loss']:.4f} val_acc: {val_metrics['accuracy']:.4f}"
+            f"val_loss: {val_metrics['loss']:.4f} val_acc: {val_metrics['accuracy']:.4f} | "
+            f"val real_acc: {val_metrics['real_acc']:.4f} fake_acc: {val_metrics['fake_acc']:.4f} "
+            f"balanced: {val_metrics['balanced_accuracy']:.4f}"
         )
 
-        if val_metrics["accuracy"] > best_val_accuracy:
-            best_val_accuracy = val_metrics["accuracy"]
+        if val_metrics[select_by] > best_val_accuracy:
+            best_val_accuracy = val_metrics[select_by]
             epochs_without_improvement = 0
             checkpoint_path = checkpoint_dir / checkpoint_name
             torch.save(model.state_dict(), checkpoint_path)
@@ -202,7 +227,7 @@ def train_temporal_model(
                 print(f"\nEarly stopping at epoch {epoch}/{epochs}.")
                 break
 
-    print(f"\nTraining done. Best val accuracy: {best_val_accuracy:.4f}")
+    print(f"\nTraining done. Best val {select_by}: {best_val_accuracy:.4f}")
     return model
 
 
@@ -234,6 +259,11 @@ def main():
                               "final hidden state (TemporalFusionAttentionModel instead of "
                               "TemporalFusionModel). This is an enhancement beyond the project "
                               "doc's original architecture spec.")
+    parser.add_argument("--extra_embeddings_root", action="append", default=[],
+                         help="Joint training: another embeddings root (any supported layout) merged "
+                              "into training. Repeatable. Append ::K to repeat its train videos K times.")
+    parser.add_argument("--select_by", default="balanced_accuracy", choices=["accuracy", "balanced_accuracy"],
+                         help="Metric used to pick the best checkpoint (default balanced_accuracy).")
     args = parser.parse_args()
 
     train_temporal_model(
@@ -252,6 +282,8 @@ def main():
         resume_from=args.resume_from,
         initial_best_accuracy=args.initial_best_accuracy,
         use_attention=args.use_attention,
+        extra_embeddings_roots=args.extra_embeddings_root,
+        select_by=args.select_by,
     )
 
 

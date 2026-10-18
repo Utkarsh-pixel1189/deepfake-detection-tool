@@ -198,6 +198,34 @@ def build_sequence_splits_cdf(
     return train_samples, val_samples, test_samples
 
 
+def build_sequence_splits_multi(embeddings_roots: list):
+    """
+    Joint multi-source version, mirroring train.py's --extra_split_root.
+
+    Each root is split INDEPENDENTLY with build_sequence_splits (same seed and
+    ratios as the CNN used for that root), so every video lands in the same
+    split as in CNN training. Train and val parts are merged; test parts are
+    merged too. A root may end in "::K" to repeat its TRAIN videos K times
+    (oversampling a small but important source).
+    """
+    train_samples, val_samples, test_samples = [], [], []
+    for spec in embeddings_roots:
+        root, _, repeat_text = spec.partition("::")
+        repeat = int(repeat_text) if repeat_text else 1
+        print(f"\n--- {root} (train x{repeat}) ---")
+        tr, va, te = build_sequence_splits(root)
+        train_samples.extend(tr * repeat)
+        val_samples.extend(va)
+        test_samples.extend(te)
+    rng = random.Random(42)
+    rng.shuffle(train_samples)
+    rng.shuffle(val_samples)
+    rng.shuffle(test_samples)
+    print(f"\nJOINT total videos -> train: {len(train_samples)}, val: {len(val_samples)}, "
+          f"test: {len(test_samples)}")
+    return train_samples, val_samples, test_samples
+
+
 if __name__ == "__main__":
     import sys
 
