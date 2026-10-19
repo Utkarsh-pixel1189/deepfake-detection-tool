@@ -22,6 +22,7 @@ Usage (Kaggle GPU, from data_pipeline/):
 """
 
 import argparse
+import io
 import json
 import random
 from collections import Counter
@@ -61,8 +62,29 @@ class ImageDataset(Dataset):
         return self.transform(img), label
 
 
+class RandomJPEG:
+    """Re-encode at a random JPEG quality so compression level is not a class cue."""
+
+    def __init__(self, qmin: int = 40, qmax: int = 95, p: float = 0.5):
+        self.qmin, self.qmax, self.p = qmin, qmax, p
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=random.randint(self.qmin, self.qmax))
+        buf.seek(0)
+        return Image.open(buf).convert("RGB")
+
+
+# Softness and file size differed between classes in the HF training set
+# (fakes softer and smaller), and the model learned that as a fake cue.
+# Blur and recompression are applied to BOTH classes so neither one can be
+# recognised by how soft or compressed it looks.
 train_tf = transforms.Compose([
     transforms.RandomHorizontalFlip(),
+    transforms.RandomApply([transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))], p=0.5),
+    RandomJPEG(qmin=40, qmax=95, p=0.5),
     transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
     transforms.ToTensor(),
     transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
