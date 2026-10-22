@@ -54,6 +54,11 @@ class ClipFaceScorer:
         img = Image.open(source).convert("RGB") if isinstance(source, (str, Path)) else source.convert("RGB")
         face = align_face(img, self.mtcnn)
         if face is None:
+            # Large photos / video frames: the face can drop under 112 px after the
+            # 512 px downscale. Retry at higher resolution; the face is still
+            # normalised to 112 -> 224, so its sharpness matches training.
+            face = align_face(img, self.mtcnn, max_side=2048)
+        if face is None:
             return None
         face = jpeg_roundtrip(face)   # training faces were saved as JPEG
         pixels = self.processor(images=face, return_tensors="pt")["pixel_values"].to(self.device, dtype=self.dtype)
