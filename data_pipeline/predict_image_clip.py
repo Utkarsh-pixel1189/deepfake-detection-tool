@@ -36,8 +36,13 @@ class ClipFaceScorer:
         from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
 
         head = np.load(head_path, allow_pickle=False)
-        self.coef = head["coef"].astype(np.float32)
-        self.intercept = float(head["intercept"])
+        self.kind = str(head["kind"]) if "kind" in head.files else "linear"
+        if self.kind == "mlp":
+            self.W0, self.b0 = head["W0"], head["b0"]
+            self.W1, self.b1 = head["W1"], head["b1"]
+        else:
+            self.coef = head["coef"].astype(np.float32)
+            self.intercept = float(head["intercept"])
         self.threshold = float(head["threshold"])
         model_name = str(head["clip_model"])
 
@@ -64,7 +69,16 @@ class ClipFaceScorer:
         pixels = self.processor(images=face, return_tensors="pt")["pixel_values"].to(self.device, dtype=self.dtype)
         emb = self.clip(pixel_values=pixels).image_embeds
         emb = torch.nn.functional.normalize(emb.float(), dim=-1).cpu().numpy()[0]
-        return float(1.0 / (1.0 + np.exp(-(emb @ self.coef + self.intercept))))
+        return self.head_prob(emb)
+
+    def head_prob(self, emb: np.ndarray) -> float:
+        """P(fake) from one L2-normalised CLIP embedding."""
+        if self.kind == "mlp":
+            h = np.maximum(emb @ self.W0 + self.b0, 0.0)
+            z = float((h @ self.W1 + self.b1).ravel()[0])
+        else:
+            z = float(emb @ self.coef + self.intercept)
+        return float(1.0 / (1.0 + np.exp(-z)))
 
 
 def list_images(folder):

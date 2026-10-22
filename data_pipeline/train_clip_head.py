@@ -24,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import roc_auc_score
 
 from loso_from_cache import best_threshold, scores
@@ -34,6 +35,8 @@ def main():
     ap.add_argument("--cache_dir", required=True)
     ap.add_argument("--out", required=True, help="Where to save the classifier (.npz).")
     ap.add_argument("--exclude", nargs="*", default=[], help="Source names to leave out.")
+    ap.add_argument("--head", choices=["linear", "mlp"], default="linear",
+                    help="linear = logistic regression; mlp = one hidden layer of 512 units.")
     ap.add_argument("--val_frac", type=float, default=0.15)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
@@ -62,19 +65,38 @@ def main():
     Xva, yva = np.concatenate(va_X), np.concatenate(va_y)
     va_src, va_grp = np.array(va_src), np.array(va_grp)
 
+    def make(param):
+        if args.head == "mlp":
+            # Small non-linear head: one hidden layer, L2 strength = param.
+            return MLPClassifier(hidden_layer_sizes=(512,), alpha=param, early_stopping=True,
+                                 validation_fraction=0.1, max_iter=200, random_state=args.seed)
+        return LogisticRegression(C=param, class_weight="balanced", max_iter=5000)
+
+    def fit(model, X, y):
+        if args.head == "mlp":
+            # MLPClassifier has no class_weight: balance the classes by sample weight.
+            w = np.where(y == 1, len(y) / (2 * max((y == 1).sum(), 1)), len(y) / (2 * max((y == 0).sum(), 1)))
+            try:
+                return model.fit(X, y, sample_weight=w)
+            except TypeError:  # older scikit-learn without sample_weight for MLP
+                return model.fit(X, y)
+        return model.fit(X, y)
+
+    grid = (1e-4, 1e-3, 1e-2) if args.head == "mlp" else (0.1, 1.0, 10.0, 100.0)
+    pname = "alpha" if args.head == "mlp" else "C"
     best = None
-    for C in (0.1, 1.0, 10.0, 100.0):
-        clf = LogisticRegression(C=C, class_weight="balanced", max_iter=5000).fit(Xtr, ytr)
+    for param in grid:
+        clf = fit(make(param), Xtr, ytr)
         b = scores(yva, clf.predict_proba(Xva)[:, 1])["balanced_accuracy"]
-        print(f"C={C:<6} val balanced {b:.3f}")
+        print(f"{pname}={param:<7} val balanced {b:.3f}", flush=True)
         if best is None or b > best[0]:
-            best = (b, C, clf)
+            best = (b, param, clf)
     _, C, clf = best
     pva = clf.predict_proba(Xva)[:, 1]
     thr = best_threshold(yva, pva)
-    print(f"-> C={C}, threshold {thr:.2f}")
+    print(f"-> {args.head} head, {pname}={C}, threshold {thr:.2f}")
 
-    report = {"C": C, "threshold": thr, "overall": scores(yva, pva, thr), "per_source": {}}
+    report = {"head": args.head, pname: C, "threshold": thr, "overall": scores(yva, pva, thr), "per_source": {}}
     print("\n=== Validation (held-out 15% of every source) ===")
     o = report["overall"]
     print(f"overall      AUC {o['auc']:.3f}  balanced {o['balanced_accuracy']:.3f}  "
@@ -91,11 +113,16 @@ def main():
             ok = float(((pva[mg] >= thr).astype(int) == lab).mean())
             print(f"    {grp:20s} ({'fake' if lab else 'real'}, n={int(mg.sum())}): correct {ok:.3f}")
 
-    # Refit on everything with the chosen C; keep the validation threshold.
-    final = LogisticRegression(C=C, class_weight="balanced", max_iter=5000).fit(
-        np.concatenate([Xtr, Xva]), np.concatenate([ytr, yva]))
-    np.savez(args.out, coef=final.coef_[0].astype(np.float32), intercept=np.float32(final.intercept_[0]),
-             threshold=np.float32(thr), clip_model=np.array(model_name or "openai/clip-vit-large-patch14"))
+    # Refit on everything with the chosen setting; keep the validation threshold.
+    final = fit(make(C), np.concatenate([Xtr, Xva]), np.concatenate([ytr, yva]))
+    common = dict(threshold=np.float32(thr), clip_model=np.array(model_name or "openai/clip-vit-large-patch14"),
+                  kind=np.array(args.head))
+    if args.head == "mlp":
+        np.savez(args.out, W0=final.coefs_[0].astype(np.float32), b0=final.intercepts_[0].astype(np.float32),
+                 W1=final.coefs_[1].astype(np.float32), b1=final.intercepts_[1].astype(np.float32), **common)
+    else:
+        np.savez(args.out, coef=final.coef_[0].astype(np.float32), intercept=np.float32(final.intercept_[0]),
+                 **common)
     Path(args.out).with_suffix(".json").write_text(json.dumps(report, indent=2))
     print(f"\nsaved classifier to {args.out} (and validation report {Path(args.out).with_suffix('.json')})")
 
