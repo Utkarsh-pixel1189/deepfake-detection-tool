@@ -24,7 +24,67 @@ from pathlib import Path
 
 import numpy as np
 from sklearn.linear_model import LogisticRegression
-from sklearn.neural_network import MLPClassifier
+
+
+class TorchMLP:
+    """768 -> 512 (ReLU) -> 1 classifier trained with PyTorch (GPU if available).
+
+    Class-balanced loss, AdamW, early stopping on an internal 10% split.
+    After fit(), coefs_/intercepts_ hold the weights in the same layout as
+    scikit-learn's MLPClassifier, so the saved head is scored with plain numpy.
+    """
+
+    def __init__(self, weight_decay=1e-3, seed=42, hidden=512, lr=1e-3, batch=512, epochs=100, patience=6):
+        self.wd, self.seed, self.hidden = weight_decay, seed, hidden
+        self.lr, self.batch, self.epochs, self.patience = lr, batch, epochs, patience
+
+    def fit(self, X, y):
+        import torch
+        import torch.nn as nn
+
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        torch.manual_seed(self.seed)
+        idx = np.random.default_rng(self.seed).permutation(len(y))
+        n_val = max(1, len(y) // 10)
+        va, tr = idx[:n_val], idx[n_val:]
+
+        Xt = torch.tensor(X, dtype=torch.float32, device=dev)
+        yt = torch.tensor(y, dtype=torch.float32, device=dev)
+        tr_t, va_t = torch.tensor(tr, device=dev), torch.tensor(va, device=dev)
+        pos, neg = int((y[tr] == 1).sum()), int((y[tr] == 0).sum())
+        loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(neg / max(pos, 1), device=dev))
+
+        model = nn.Sequential(nn.Linear(X.shape[1], self.hidden), nn.ReLU(), nn.Linear(self.hidden, 1)).to(dev)
+        opt = torch.optim.AdamW(model.parameters(), lr=self.lr, weight_decay=self.wd)
+        best_loss, best_state, bad = float("inf"), None, 0
+        for _ in range(self.epochs):
+            model.train()
+            perm = tr_t[torch.randperm(len(tr_t), device=dev)]
+            for i in range(0, len(perm), self.batch):
+                b = perm[i:i + self.batch]
+                opt.zero_grad()
+                loss_fn(model(Xt[b]).squeeze(1), yt[b]).backward()
+                opt.step()
+            model.eval()
+            with torch.no_grad():
+                vl = loss_fn(model(Xt[va_t]).squeeze(1), yt[va_t]).item()
+            if vl < best_loss - 1e-4:
+                best_loss, bad = vl, 0
+                best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            else:
+                bad += 1
+                if bad >= self.patience:
+                    break
+        model.load_state_dict(best_state)
+        model = model.cpu()
+        self.coefs_ = [model[0].weight.detach().numpy().T.copy(), model[2].weight.detach().numpy().T.copy()]
+        self.intercepts_ = [model[0].bias.detach().numpy().copy(), model[2].bias.detach().numpy().copy()]
+        return self
+
+    def predict_proba(self, X):
+        h = np.maximum(X @ self.coefs_[0] + self.intercepts_[0], 0.0)
+        p = 1.0 / (1.0 + np.exp(-(h @ self.coefs_[1] + self.intercepts_[1]).ravel()))
+        return np.stack([1.0 - p, p], axis=1)
 from sklearn.metrics import roc_auc_score
 
 from loso_from_cache import best_threshold, scores
@@ -67,19 +127,11 @@ def main():
 
     def make(param):
         if args.head == "mlp":
-            # Small non-linear head: one hidden layer, L2 strength = param.
-            return MLPClassifier(hidden_layer_sizes=(512,), alpha=param, early_stopping=True,
-                                 validation_fraction=0.1, max_iter=200, random_state=args.seed)
+            # Small non-linear head on the GPU: one hidden layer, weight decay = param.
+            return TorchMLP(weight_decay=param, seed=args.seed)
         return LogisticRegression(C=param, class_weight="balanced", max_iter=5000)
 
     def fit(model, X, y):
-        if args.head == "mlp":
-            # MLPClassifier has no class_weight: balance the classes by sample weight.
-            w = np.where(y == 1, len(y) / (2 * max((y == 1).sum(), 1)), len(y) / (2 * max((y == 0).sum(), 1)))
-            try:
-                return model.fit(X, y, sample_weight=w)
-            except TypeError:  # older scikit-learn without sample_weight for MLP
-                return model.fit(X, y)
         return model.fit(X, y)
 
     grid = (1e-4, 1e-3, 1e-2) if args.head == "mlp" else (0.1, 1.0, 10.0, 100.0)
