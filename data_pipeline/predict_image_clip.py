@@ -1,0 +1,123 @@
+"""
+predict_image_clip.py
+
+Scores still images as real or AI-generated/deepfake using:
+  face alignment (same as training) -> frozen CLIP ViT-L/14 -> logistic
+  regression head trained by train_clip_head.py.
+
+Images with no usable face are reported as "NO FACE FOUND", never as real.
+
+Usage:
+  Score some images:
+    python predict_image_clip.py --head clip_head.npz --images a.jpg b.png
+  Score a whole folder:
+    python predict_image_clip.py --head clip_head.npz --folder photos/
+  Real-world test (Akash, step 4): a folder with real/ and fake/ subfolders.
+  Writes a per-image CSV and prints accuracy per subfolder:
+    python predict_image_clip.py --head clip_head.npz --eval_dir real_world_test/ --csv results.csv
+"""
+
+import argparse
+import csv
+from pathlib import Path
+
+import numpy as np
+import torch
+from PIL import Image
+
+from predict_image import align_face, jpeg_roundtrip
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+
+class ClipFaceScorer:
+    def __init__(self, head_path: str, device=None):
+        from facenet_pytorch import MTCNN
+        from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
+
+        head = np.load(head_path, allow_pickle=False)
+        self.coef = head["coef"].astype(np.float32)
+        self.intercept = float(head["intercept"])
+        self.threshold = float(head["threshold"])
+        model_name = str(head["clip_model"])
+
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.dtype = torch.float16 if self.device.type == "cuda" else torch.float32
+        self.mtcnn = MTCNN(keep_all=True, device=self.device)
+        self.processor = CLIPImageProcessor.from_pretrained(model_name)
+        self.clip = CLIPVisionModelWithProjection.from_pretrained(model_name, torch_dtype=self.dtype)
+        self.clip.to(self.device).eval()
+
+    @torch.no_grad()
+    def score(self, source):
+        """source: path or PIL image. Returns P(fake) in [0, 1], or None if no usable face."""
+        img = Image.open(source).convert("RGB") if isinstance(source, (str, Path)) else source.convert("RGB")
+        face = align_face(img, self.mtcnn)
+        if face is None:
+            return None
+        face = jpeg_roundtrip(face)   # training faces were saved as JPEG
+        pixels = self.processor(images=face, return_tensors="pt")["pixel_values"].to(self.device, dtype=self.dtype)
+        emb = self.clip(pixel_values=pixels).image_embeds
+        emb = torch.nn.functional.normalize(emb.float(), dim=-1).cpu().numpy()[0]
+        return float(1.0 / (1.0 + np.exp(-(emb @ self.coef + self.intercept))))
+
+
+def list_images(folder):
+    return sorted(p for p in Path(folder).rglob("*") if p.suffix.lower() in IMAGE_EXTS)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--head", required=True, help="clip_head.npz from train_clip_head.py")
+    ap.add_argument("--images", nargs="*", default=[])
+    ap.add_argument("--folder", default=None)
+    ap.add_argument("--eval_dir", default=None, help="Folder with real/ and fake/ subfolders.")
+    ap.add_argument("--csv", default=None, help="Write per-image results here.")
+    ap.add_argument("--threshold", type=float, default=None, help="Override the saved threshold.")
+    args = ap.parse_args()
+
+    items = [(Path(p), "") for p in args.images]
+    if args.folder:
+        items += [(p, "") for p in list_images(args.folder)]
+    if args.eval_dir:
+        for label in ("real", "fake"):
+            d = Path(args.eval_dir) / label
+            if d.exists():
+                items += [(p, label) for p in list_images(d)]
+    if not items:
+        ap.error("give --images, --folder or --eval_dir")
+
+    scorer = ClipFaceScorer(args.head)
+    thr = args.threshold if args.threshold is not None else scorer.threshold
+    print(f"threshold {thr:.2f} (P(fake) at or above this = FAKE)")
+
+    rows = []
+    for p, true in items:
+        s = scorer.score(p)
+        verdict = "NO FACE" if s is None else ("FAKE" if s >= thr else "REAL")
+        rows.append({"file": str(p), "true_label": true, "p_fake": "" if s is None else f"{s:.4f}",
+                     "verdict": verdict})
+        print(f"{p.name}: " + ("NO FACE FOUND (not scored)" if s is None else f"P(fake)={s:.3f} -> {verdict}")
+              + (f"  [true: {true}]" if true else ""))
+
+    if args.csv:
+        with open(args.csv, "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=["file", "true_label", "p_fake", "verdict"])
+            w.writeheader()
+            w.writerows(rows)
+        print(f"\nsaved {args.csv}")
+
+    labelled = [r for r in rows if r["true_label"]]
+    if labelled:
+        print("\n=== Accuracy (images with a face) ===")
+        for label in ("real", "fake"):
+            group = [r for r in labelled if r["true_label"] == label]
+            scored = [r for r in group if r["verdict"] != "NO FACE"]
+            if group:
+                ok = sum(r["verdict"].lower() == label for r in scored)
+                acc = ok / len(scored) if scored else float("nan")
+                print(f"  {label}: {ok}/{len(scored)} correct ({acc:.1%}); no face found in {len(group) - len(scored)}")
+
+
+if __name__ == "__main__":
+    main()
