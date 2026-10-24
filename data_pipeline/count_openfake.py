@@ -23,20 +23,29 @@ def main():
     files = sorted(fs.glob("datasets/ComplexDataLab/OpenFake/core/train-*.parquet"))
     print(len(files), "train shards", flush=True)
 
-    fakes, reals = Counter(), 0
-    for i, f in enumerate(files):
-        try:
-            t = pq.read_table(fs.open(f), columns=["label", "model"]).to_pydict()
-        except Exception as e:
-            print(f"  could not read {f.split('/')[-1]}: {str(e)[:150]}", flush=True)
-            continue
-        for label, model in zip(t["label"], t["model"]):
-            if str(label).strip().lower() == "real":
-                reals += 1
-            else:
-                fakes[str(model)] += 1
-        if i % 50 == 0:
-            print(f"{i}/{len(files)} shards read", flush=True)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def read_one(f):
+        # Each shard is a few small network reads, so many can run at once.
+        return pq.read_table(HfFileSystem().open(f), columns=["label", "model"]).to_pydict()
+
+    fakes, reals, done = Counter(), 0, 0
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        futures = {pool.submit(read_one, f): f for f in files}
+        for fut in as_completed(futures):
+            done += 1
+            try:
+                t = fut.result()
+            except Exception as e:
+                print(f"  could not read {futures[fut].split('/')[-1]}: {str(e)[:150]}", flush=True)
+                continue
+            for label, model in zip(t["label"], t["model"]):
+                if str(label).strip().lower() == "real":
+                    reals += 1
+                else:
+                    fakes[str(model)] += 1
+            if done % 50 == 0:
+                print(f"{done}/{len(files)} shards read", flush=True)
 
     print(f"\nreal rows: {reals}")
     print("fake rows per generator:")
