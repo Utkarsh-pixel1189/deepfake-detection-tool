@@ -90,6 +90,8 @@ def main(argv=None, aligner=None, open_file=None, files=None):
     ap.add_argument("--no_keyword_filter", action="store_true")
     ap.add_argument("--batch_rows", type=int, default=32)
     ap.add_argument("--min_face", type=int, default=112)
+    ap.add_argument("--max_side", type=int, default=2048,
+                    help="Detect faces at up to this resolution (full resolution keeps faces in large images).")
     args = ap.parse_args(argv)
 
     if files is None or open_file is None:
@@ -121,7 +123,7 @@ def main(argv=None, aligner=None, open_file=None, files=None):
         print(f"resuming: {sum(kept.values())} faces already saved")
 
     if aligner is None:
-        aligner = FaceAligner(min_face=args.min_face)
+        aligner = FaceAligner(max_side=args.max_side, min_face=args.min_face)
     seen, skipped_kw, reasons, widths = Counter(), 0, Counter(), {"real": [], "fake": []}
 
     def all_full():
