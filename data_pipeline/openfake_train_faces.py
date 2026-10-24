@@ -104,9 +104,17 @@ def main(argv=None, files=None, open_file=None, aligner=None):
     def is_full(model):
         return kept[model] >= quota.get(model, 0)
 
-    q = queue.Queue(maxsize=256)
+    q = queue.Queue(maxsize=64)
+
+    def decode(data):
+        """Decode in the reader threads (parallel). For big JPEGs (e.g. Pexels
+        photos) decode straight at reduced size: much faster, same detection size."""
+        img = Image.open(io.BytesIO(data))
+        if img.format == "JPEG":
+            img.draft("RGB", (args.max_side, args.max_side))
+        return img.convert("RGB")
     lock = threading.Lock()
-    stats = {"bytes": 0, "shards_done": 0, "errors": 0}
+    stats = {"bytes": 0, "shards_done": 0, "errors": 0, "rg_done": 0, "rg_per_shard": 0}
 
     def reader(paths):
         for f in paths:
@@ -114,7 +122,11 @@ def main(argv=None, files=None, open_file=None, aligner=None):
             try:
                 pf = pq.ParquetFile(open_file(f), pre_buffer=True)
                 has_row_id = "row_id" in pf.schema_arrow.names
+                with lock:
+                    stats["rg_per_shard"] = max(stats["rg_per_shard"], pf.metadata.num_row_groups)
                 for rg in range(pf.metadata.num_row_groups):
+                    with lock:
+                        stats["rg_done"] += 1
                     meta = pf.read_row_group(rg, columns=["label", "model"]).to_pydict()
                     rows = [i for i, (lab, m) in enumerate(zip(meta["label"], meta["model"]))
                             if m in quota and not is_full(m)
@@ -132,7 +144,11 @@ def main(argv=None, files=None, open_file=None, aligner=None):
                     ids = t.column("row_id") if has_row_id else None
                     for i in rows:
                         rid = ids[i].as_py() if ids is not None else f"{name}_{rg}_{i}"
-                        q.put((meta["model"][i], rid, images[i].as_py()["bytes"]))
+                        try:
+                            img = decode(images[i].as_py()["bytes"])
+                        except Exception:
+                            img = None
+                        q.put((meta["model"][i], rid, img))
             except Exception as e:
                 with lock:
                     stats["errors"] += 1
@@ -158,11 +174,14 @@ def main(argv=None, files=None, open_file=None, aligner=None):
         with lock:
             done, gb = stats["shards_done"], stats["bytes"] / 1e9
         speed = gb * 1000 / el if el > 0 else 0
-        eta = el / done * (len(chosen) - done) if done else float("nan")
-        eta_txt = "estimating..." if not done else (fmt_time(eta) if not final else "-")
+        # Estimate from row groups (blocks) processed, so it works before any shard finishes.
+        with lock:
+            rg_done, rg_total = stats["rg_done"], stats["rg_per_shard"] * len(chosen)
+        eta = el / rg_done * (rg_total - rg_done) if rg_done and rg_total else float("nan")
+        eta_txt = "-" if final else ("estimating..." if eta != eta else fmt_time(eta))
         kept_txt = ", ".join(f"{m} {kept[m]}" for m in quota)
         print(f"[{fmt_time(el)}] shards {done}/{len(chosen)} | {gb:.1f} GB at {speed:.0f} MB/s | "
-              f"time left ~{eta_txt} | kept: {kept_txt}", flush=True)
+              f"time left ~{eta_txt} | queue {q.qsize()}/64 | kept: {kept_txt}", flush=True)
 
     while finished < n_workers:
         try:
@@ -177,7 +196,9 @@ def main(argv=None, files=None, open_file=None, aligner=None):
             if not is_full(model) and not target.exists():
                 checked[model] += 1
                 try:
-                    face, info = aligner(Image.open(io.BytesIO(data)).convert("RGB"))
+                    if data is None:
+                        raise ValueError("unreadable image")
+                    face, info = aligner(data)
                 except Exception:
                     bad += 1
                     face, info = None, "error"
