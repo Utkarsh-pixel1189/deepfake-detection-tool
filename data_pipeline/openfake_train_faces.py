@@ -46,7 +46,7 @@ DEFAULT_QUOTAS = {
     "gpt-image-1": 1500,
     "imagen-4.0": 500,
     "imagen-3.0-002": 200,
-    "pexels": 2000,          # real photos
+    "pexels": 600,           # real photos (big files, slow to check, so capped)
 }
 
 
@@ -69,7 +69,7 @@ def main(argv=None, files=None, open_file=None, aligner=None):
     ap.add_argument("--shards", type=int, default=40, help="How many random training shards to stream.")
     ap.add_argument("--workers", type=int, default=8, help="Shards downloaded in parallel.")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--max_side", type=int, default=2048)
+    ap.add_argument("--max_side", type=int, default=1024)
     ap.add_argument("--min_face", type=int, default=112)
     ap.add_argument("--quota", action="append", default=[], help="Override, e.g. --quota gpt-image-1=2000")
     ap.add_argument("--split", default="train")
@@ -107,14 +107,32 @@ def main(argv=None, files=None, open_file=None, aligner=None):
     q = queue.Queue(maxsize=64)
 
     def decode(data):
-        """Decode in the reader threads (parallel). For big JPEGs (e.g. Pexels
-        photos) decode straight at reduced size: much faster, same detection size."""
+        """Decode AND shrink in the reader threads (parallel), so the main thread
+        only runs face detection. JPEGs are decoded straight at reduced size."""
         img = Image.open(io.BytesIO(data))
         if img.format == "JPEG":
             img.draft("RGB", (args.max_side, args.max_side))
-        return img.convert("RGB")
+        img = img.convert("RGB")
+        if max(img.size) > args.max_side:          # same Lanczos shrink training used
+            s = args.max_side / max(img.size)
+            img = img.resize((max(1, round(img.width * s)), max(1, round(img.height * s))), Image.LANCZOS)
+        return img
+
     lock = threading.Lock()
-    stats = {"bytes": 0, "shards_done": 0, "errors": 0, "rg_done": 0, "rg_per_shard": 0}
+    stats = {"bytes": 0, "shards_done": 0, "errors": 0, "rg_done": 0, "rg_per_shard": 0, "rg_skipped": 0}
+
+    # Blocks fully handled in earlier runs are recorded here, so a restart does
+    # not download them again.
+    out.mkdir(parents=True, exist_ok=True)
+    done_file = out / "_done_blocks.txt"
+    done_blocks = set(done_file.read_text().split()) if done_file.exists() else set()
+    if done_blocks:
+        print(f"resuming: {len(done_blocks)} blocks already handled, they will be skipped", flush=True)
+
+    def mark_done(key):
+        with lock:
+            with open(done_file, "a") as fh:
+                fh.write(key + "\n")
 
     def reader(paths):
         for f in paths:
@@ -125,13 +143,19 @@ def main(argv=None, files=None, open_file=None, aligner=None):
                 with lock:
                     stats["rg_per_shard"] = max(stats["rg_per_shard"], pf.metadata.num_row_groups)
                 for rg in range(pf.metadata.num_row_groups):
+                    key = f"{name}:{rg}"
                     with lock:
                         stats["rg_done"] += 1
+                    if key in done_blocks:
+                        with lock:
+                            stats["rg_skipped"] += 1
+                        continue
                     meta = pf.read_row_group(rg, columns=["label", "model"]).to_pydict()
                     rows = [i for i, (lab, m) in enumerate(zip(meta["label"], meta["model"]))
                             if m in quota and not is_full(m)
                             and ((str(lab).strip().lower() == "real") == (m == "pexels"))]
                     if not rows:
+                        mark_done(key)
                         continue
                     cols = ["image", "row_id"] if has_row_id else ["image"]
                     t = pf.read_row_group(rg, columns=cols)
@@ -144,11 +168,15 @@ def main(argv=None, files=None, open_file=None, aligner=None):
                     ids = t.column("row_id") if has_row_id else None
                     for i in rows:
                         rid = ids[i].as_py() if ids is not None else f"{name}_{rg}_{i}"
+                        model = meta["model"][i]
+                        if is_full(model) or (out / folder_for(model) / f"{safe(rid)}.jpg").exists():
+                            continue
                         try:
                             img = decode(images[i].as_py()["bytes"])
                         except Exception:
                             img = None
-                        q.put((meta["model"][i], rid, img))
+                        q.put((model, rid, img))
+                    mark_done(key)
             except Exception as e:
                 with lock:
                     stats["errors"] += 1
@@ -165,6 +193,13 @@ def main(argv=None, files=None, open_file=None, aligner=None):
         from openfake_faces import FaceAligner
 
         aligner = FaceAligner(max_side=args.max_side, min_face=args.min_face)
+        # Faces narrower than min_face are thrown away anyway, so tell the detector
+        # not to search for tiny faces: far fewer image scales, much faster.
+        from facenet_pytorch import MTCNN
+
+        aligner.mtcnn = MTCNN(keep_all=True, device=aligner.device,
+                              min_face_size=max(20, int(args.min_face * 0.6)))
+        print(f"face detection on {aligner.device}, images shrunk to {args.max_side}px", flush=True)
 
     t0 = last = time.time()
     finished, checked, no_face, small, bad = 0, Counter(), 0, 0, 0
@@ -176,12 +211,16 @@ def main(argv=None, files=None, open_file=None, aligner=None):
         speed = gb * 1000 / el if el > 0 else 0
         # Estimate from row groups (blocks) processed, so it works before any shard finishes.
         with lock:
-            rg_done, rg_total = stats["rg_done"], stats["rg_per_shard"] * len(chosen)
-        eta = el / rg_done * (rg_total - rg_done) if rg_done and rg_total else float("nan")
+            rg_done, rg_skip = stats["rg_done"], stats["rg_skipped"]
+            rg_total = stats["rg_per_shard"] * len(chosen)
+        work_done = rg_done - rg_skip                 # blocks actually processed this run
+        eta = el / work_done * (rg_total - rg_done) if work_done and rg_total else float("nan")
         eta_txt = "-" if final else ("estimating..." if eta != eta else fmt_time(eta))
         kept_txt = ", ".join(f"{m} {kept[m]}" for m in quota)
-        print(f"[{fmt_time(el)}] shards {done}/{len(chosen)} | {gb:.1f} GB at {speed:.0f} MB/s | "
-              f"time left ~{eta_txt} | queue {q.qsize()}/64 | kept: {kept_txt}", flush=True)
+        rate = sum(checked.values()) / el if el > 0 else 0
+        print(f"[{fmt_time(el)}] blocks {rg_done}/{rg_total or '?'} | {gb:.1f} GB at {speed:.0f} MB/s | "
+              f"faces checked {rate:.1f}/s | time left ~{eta_txt} | queue {q.qsize()}/64 | kept: {kept_txt}",
+              flush=True)
 
     while finished < n_workers:
         try:
