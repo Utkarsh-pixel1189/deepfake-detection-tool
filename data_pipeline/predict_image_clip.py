@@ -25,9 +25,13 @@ import numpy as np
 import torch
 from PIL import Image
 
-from predict_image import align_face, jpeg_roundtrip
+from predict_image import jpeg_roundtrip
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+MIN_FACE = 112     # same minimum face width as training
+SMALL_FACE = 64    # smaller faces are scored only as a low-confidence fallback
+MAX_FACES = 5      # group photos: score up to the 5 largest faces, report the highest P(fake)
+DET_PROB = 0.90    # MTCNN confidence needed to count as a face
 
 
 class ClipFaceScorer:
@@ -53,23 +57,67 @@ class ClipFaceScorer:
         self.clip = CLIPVisionModelWithProjection.from_pretrained(model_name, torch_dtype=self.dtype)
         self.clip.to(self.device).eval()
 
+    def find_faces(self, img):
+        """All usable faces in the image, as 224x224 crops (largest first, at most MAX_FACES).
+
+        Same preprocessing as training (shrink, MTCNN, crop, 112 -> 224). Tries
+        512 px first (training size), then 2048 px for big photos and group shots.
+        If only small faces (SMALL_FACE..112 px) exist, they are used too, but the
+        result is flagged low_confidence: they had to be enlarged, so they are
+        softer than anything the model saw in training.
+        Returns (crops, widths, low_confidence)."""
+        from mtcnn_align import OUTPUT_SIZE
+        from prepare_image_faces import downscale
+
+        for max_side in (512, 2048):
+            small = downscale(img, max_side)
+            boxes, probs = self.mtcnn.detect(small)
+            if boxes is None:
+                continue
+            cands = []
+            for b, p in zip(boxes, probs):
+                if p is None or p < DET_PROB:
+                    continue
+                x1, y1 = max(0.0, float(b[0])), max(0.0, float(b[1]))
+                x2, y2 = min(float(small.width), float(b[2])), min(float(small.height), float(b[3]))
+                cands.append((x2 - x1, (x1, y1, x2, y2)))
+            big = [c for c in cands if c[0] >= MIN_FACE]
+            if big:
+                chosen, low = big, False
+            elif max_side == 2048 and any(c[0] >= SMALL_FACE for c in cands):
+                chosen, low = [c for c in cands if c[0] >= SMALL_FACE], True
+            else:
+                continue
+            chosen = sorted(chosen, key=lambda c: -c[0])[:MAX_FACES]
+            crops = [small.crop(box).resize((MIN_FACE, MIN_FACE), Image.LANCZOS).resize(OUTPUT_SIZE, Image.BICUBIC)
+                     for _, box in chosen]
+            return crops, [w for w, _ in chosen], low
+        return [], [], False
+
     @torch.no_grad()
-    def score(self, source):
-        """source: path or PIL image. Returns P(fake) in [0, 1], or None if no usable face."""
-        img = Image.open(source).convert("RGB") if isinstance(source, (str, Path)) else source.convert("RGB")
-        face = align_face(img, self.mtcnn)
-        if face is None:
-            # Large photos / video frames: the face can drop under 112 px after the
-            # 512 px downscale. Retry at higher resolution; the face is still
-            # normalised to 112 -> 224, so its sharpness matches training.
-            face = align_face(img, self.mtcnn, max_side=2048)
-        if face is None:
-            return None
-        face = jpeg_roundtrip(face)   # training faces were saved as JPEG
-        pixels = self.processor(images=face, return_tensors="pt")["pixel_values"].to(self.device, dtype=self.dtype)
+    def face_probs(self, faces):
+        """P(fake) for a list of 224x224 face crops."""
+        faces = [jpeg_roundtrip(f) for f in faces]   # training faces were saved as JPEG
+        pixels = self.processor(images=faces, return_tensors="pt")["pixel_values"].to(self.device, dtype=self.dtype)
         emb = self.clip(pixel_values=pixels).image_embeds
-        emb = torch.nn.functional.normalize(emb.float(), dim=-1).cpu().numpy()[0]
-        return self.head_prob(emb)
+        emb = torch.nn.functional.normalize(emb.float(), dim=-1).cpu().numpy()
+        return [self.head_prob(e) for e in emb]
+
+    def score_details(self, source):
+        """source: path or PIL image. Returns a dict:
+        p_fake (max over faces, or None if no usable face), faces (width + p_fake each),
+        low_confidence (True if only small faces were found)."""
+        img = Image.open(source).convert("RGB") if isinstance(source, (str, Path)) else source.convert("RGB")
+        crops, widths, low = self.find_faces(img)
+        if not crops:
+            return {"p_fake": None, "faces": [], "low_confidence": False}
+        probs = self.face_probs(crops)
+        return {"p_fake": max(probs), "low_confidence": low,
+                "faces": [{"width_px": round(w), "p_fake": p} for w, p in zip(widths, probs)]}
+
+    def score(self, source):
+        """P(fake) in [0, 1] (highest over the faces in the image), or None if no usable face."""
+        return self.score_details(source)["p_fake"]
 
     def head_prob(self, emb: np.ndarray) -> float:
         """P(fake) from one L2-normalised CLIP embedding."""
@@ -112,16 +160,20 @@ def main():
 
     rows = []
     for p, true in items:
-        s = scorer.score(p)
+        d = scorer.score_details(p)
+        s = d["p_fake"]
         verdict = "NO FACE" if s is None else ("FAKE" if s >= thr else "REAL")
+        n_faces = len(d["faces"])
         rows.append({"file": str(p), "true_label": true, "p_fake": "" if s is None else f"{s:.4f}",
-                     "verdict": verdict})
+                     "verdict": verdict, "faces": n_faces, "low_confidence": d["low_confidence"]})
+        extra = f"  ({n_faces} faces{', small faces - low confidence' if d['low_confidence'] else ''})" \
+            if n_faces > 1 or d["low_confidence"] else ""
         print(f"{p.name}: " + ("NO FACE FOUND (not scored)" if s is None else f"P(fake)={s:.3f} -> {verdict}")
-              + (f"  [true: {true}]" if true else ""))
+              + extra + (f"  [true: {true}]" if true else ""))
 
     if args.csv:
         with open(args.csv, "w", newline="") as fh:
-            w = csv.DictWriter(fh, fieldnames=["file", "true_label", "p_fake", "verdict"])
+            w = csv.DictWriter(fh, fieldnames=["file", "true_label", "p_fake", "verdict", "faces", "low_confidence"])
             w.writeheader()
             w.writerows(rows)
         print(f"\nsaved {args.csv}")
